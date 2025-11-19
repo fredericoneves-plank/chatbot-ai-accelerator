@@ -3,10 +3,10 @@
 import { useEffect, useState, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/contexts/AuthContext'
-import { useChat } from '@ai-sdk/react'
 import { ChatSidebar } from '@/components/chat/ChatSidebar'
 import { ChatMessages } from '@/components/chat/ChatMessages'
 import { ChatInput } from '@/components/chat/ChatInput'
+import type { UIMessage } from 'ai'
 
 interface ChatHistory {
   id: string
@@ -20,58 +20,10 @@ export default function ChatPage() {
   const [chatHistory, setChatHistory] = useState<ChatHistory[]>([])
   const [currentChatId, setCurrentChatId] = useState<string | null>(null)
   const [isLoadingHistory, setIsLoadingHistory] = useState(false)
+  const [messages, setMessages] = useState<UIMessage[]>([])
   const [input, setInput] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
   const chatIdRef = useRef<string | null>(null)
-
-  const { messages, setMessages, sendMessage, status } = useChat({
-    transport: {
-      sendMessages: async ({ messages, abortSignal }) => {
-        // Use the ref to ensure we have the latest chatId
-        const chatIdToSend = chatIdRef.current || currentChatId
-
-        const response = await fetch('/api/chat', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          credentials: 'include',
-          body: JSON.stringify({
-            messages,
-            chatId: chatIdToSend,
-          }),
-          signal: abortSignal,
-        })
-
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`)
-        }
-
-        const chatId = response.headers.get('X-Chat-Id')
-        if (chatId) {
-          // Always update both state and ref
-          setCurrentChatId(chatId)
-          chatIdRef.current = chatId
-          if (chatId !== chatIdToSend) {
-            loadChatHistory()
-          }
-        }
-
-        if (!response.body) {
-          throw new Error('Response body is null')
-        }
-
-        return response.body as any
-      },
-      reconnectToStream: async ({ chatId }) => {
-        return null
-      },
-    },
-    onFinish: async () => {
-      await loadChatHistory()
-    },
-  })
-
-  const isLoading = status === 'submitted' || status === 'streaming'
 
   const loadChatHistory = async () => {
     if (!user) return
@@ -158,15 +110,82 @@ export default function ChatPage() {
     e.preventDefault()
     if (!input.trim() || isLoading) return
 
-    sendMessage({
+    const userMessage = input.trim()
+    setInput('')
+    setIsLoading(true)
+
+    // Add user message optimistically
+    const userMessageObj: UIMessage = {
+      id: Date.now().toString(),
+      role: 'user',
       parts: [
         {
           type: 'text',
-          text: input,
+          text: userMessage,
         },
       ],
-    })
-    setInput('')
+    }
+    setMessages(prev => [...prev, userMessageObj])
+
+    try {
+      const chatIdToSend = chatIdRef.current || currentChatId
+
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        credentials: 'include',
+        body: JSON.stringify({
+          messages: [...messages, userMessageObj],
+          chatId: chatIdToSend,
+        }),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(
+          errorData.error || `HTTP error! status: ${response.status}`
+        )
+      }
+
+      const data = await response.json()
+      const chatId = response.headers.get('X-Chat-Id') || data.chatId
+
+      if (chatId) {
+        setCurrentChatId(chatId)
+        chatIdRef.current = chatId
+        if (chatId !== chatIdToSend) {
+          loadChatHistory()
+        }
+      }
+
+      // Add AI response to messages
+      const aiMessageObj: UIMessage = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        parts: [
+          {
+            type: 'text',
+            text: data.message,
+          },
+        ],
+      }
+      setMessages(prev => [...prev, aiMessageObj])
+
+      // Reload messages from DB to ensure consistency
+      if (chatId) {
+        await loadChatMessages(chatId)
+      }
+    } catch (error) {
+      console.error('Error sending message:', error)
+      // Remove the user message that was added optimistically
+      setMessages(prev => prev.slice(0, -1))
+      // Show error to user
+      alert('Failed to send message. Please try again.')
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   if (loading) {

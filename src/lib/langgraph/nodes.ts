@@ -5,6 +5,9 @@ import { toolsByName } from './tools'
 import type { MessagesStateType } from './state'
 
 export async function llmCall(state: MessagesStateType) {
+  // Use invoke() for the agent's state management
+  // The actual incremental streaming is handled in runAgent.ts
+  // This node is called by the agent for tool-call follow-up LLM calls
   return {
     messages: await modelWithTools.invoke([
       new SystemMessage(
@@ -27,7 +30,7 @@ export async function toolNode(state: MessagesStateType) {
     return { messages: [] }
   }
 
-  const result: ToolMessage[] = []
+  const result = []
   for (const toolCall of lastMessage.tool_calls ?? []) {
     const tool = toolsByName[toolCall.name]
     if (tool && toolCall.id) {

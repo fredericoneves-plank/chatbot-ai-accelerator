@@ -1,5 +1,3 @@
-import { streamText } from 'ai'
-import { anthropic } from '@ai-sdk/anthropic'
 import { createClient } from '@/lib/supabase/server'
 import { runAgent } from '@/lib/langgraph/agent'
 import {
@@ -21,6 +19,9 @@ function extractTextFromMessage(message: any): string {
 }
 
 export async function POST(req: Request) {
+  let currentChatId: string | null = null
+  let userMessageSaved = false
+
   try {
     const supabase = await createClient()
     const {
@@ -51,7 +52,7 @@ export async function POST(req: Request) {
     const lastMessageContent = extractTextFromMessage(lastMessage)
 
     // Get or create chat
-    const currentChatId = await getOrCreateChat(
+    currentChatId = await getOrCreateChat(
       supabase,
       user.id,
       chatId || null,
@@ -62,14 +63,27 @@ export async function POST(req: Request) {
       return new Response('Failed to create chat', { status: 500 })
     }
 
-    // Always save user message - it's a new message from the user
-    // currentChatId is correct (either existing chatId or newly created)
-    await saveMessage(supabase, currentChatId, 'user', lastMessageContent)
+    // Save user message - wrapped in try-catch to handle errors
+    try {
+      await saveMessage(supabase, currentChatId, 'user', lastMessageContent)
+      userMessageSaved = true
+    } catch (error) {
+      console.error('Error saving user message:', error)
+      return new Response(
+        JSON.stringify({ error: 'Failed to save user message' }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } }
+      )
+    }
 
     // Update chat title only if it's a new chat (chatId wasn't provided)
     if (!chatId) {
-      const title = lastMessageContent.substring(0, 50)
-      await updateChatTitle(supabase, currentChatId, title)
+      try {
+        const title = lastMessageContent.substring(0, 50)
+        await updateChatTitle(supabase, currentChatId, title)
+      } catch (error) {
+        console.error('Error updating chat title:', error)
+        // Don't fail the request if title update fails
+      }
     }
 
     // Convert UIMessages to simple format for LangGraph
@@ -78,45 +92,47 @@ export async function POST(req: Request) {
       content: extractTextFromMessage(msg),
     }))
 
-    // Run LangGraph agent to get response (handles tool calling internally)
-    const agentResponse = await runAgent(
-      lastMessageContent,
-      conversationHistory
-    )
-
-    const responseText =
-      typeof agentResponse === 'string' ? agentResponse : String(agentResponse)
-
-    // Save the assistant response immediately
-    // This ensures it's saved even if streaming fails
-    const saveResponse = async () => {
-      await saveMessage(supabase, currentChatId, 'assistant', responseText)
+    // Run the agent with invoke() to get the full response
+    let aiResponse: string
+    try {
+      aiResponse = await runAgent(lastMessageContent, conversationHistory)
+    } catch (error) {
+      console.error('Error running agent:', error)
+      // If agent fails, we should not save the user message
+      // Since it's already saved, we'll return an error
+      // In a production app, you might want to delete the user message
+      return new Response(
+        JSON.stringify({ error: 'Failed to generate AI response' }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } }
+      )
     }
 
-    // Save the assistant response immediately BEFORE returning the response
-    // This ensures it completes before the request context ends
+    // Save the AI response - wrapped in try-catch
     try {
-      await saveResponse()
+      await saveMessage(supabase, currentChatId, 'assistant', aiResponse)
     } catch (error) {
       console.error('Error saving assistant message:', error)
-      // Continue anyway - we don't want to fail the request if save fails
+      // If saving AI response fails, we still return the response to the user
+      // but log the error
     }
 
-    // Use streamText to create a proper AI SDK stream format
-    const result = streamText({
-      model: anthropic('claude-sonnet-4-5-20250929'),
-      prompt: responseText,
-    })
-
-    // Use toTextStreamResponse - this creates a stream that useChat can parse
-    // The custom transport will handle the stream parsing automatically
-    return result.toTextStreamResponse({
-      headers: {
-        'X-Chat-Id': currentChatId,
-      },
-    })
+    // Return JSON response with the AI message
+    return new Response(
+      JSON.stringify({
+        message: aiResponse,
+        chatId: currentChatId,
+      }),
+      {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Chat-Id': currentChatId,
+        },
+      }
+    )
   } catch (error) {
     console.error('Error in chat API:', error)
+
     return new Response(JSON.stringify({ error: 'Internal server error' }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
